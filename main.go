@@ -17,7 +17,9 @@ var (
 )
 
 const (
-    SOCKS_VERSION = uint8(5)
+    socksVersion = uint8(5)
+    authVersion = uint8(1)
+
 	NoAuth          = uint8(0)
 	noAcceptable    = uint8(255)
 	UserPassAuth    = uint8(2)
@@ -53,8 +55,8 @@ type Request struct {
     DSTPort int
 }
 
-func reply(r io.Writer, rep byte, rest ...byte) {
-    _,err := r.Write(append([]byte{SOCKS_VERSION, rep}, rest...))
+func reply(r io.Writer, data ...byte) {
+    _,err := r.Write(data)
     if err != nil {
         panic(err)
     }
@@ -84,6 +86,7 @@ func readRequest(r io.Reader)(*Request) {
         name := read(r, n)
         req.DSTAddr = string(name)
     default:
+        log.Println("Unsupport address type:", atype)
         return nil
     }
     port := read(r,2)
@@ -91,24 +94,28 @@ func readRequest(r io.Reader)(*Request) {
     return &req
 }
 
-func Auth(bufConn io.ReadWriter) bool {
-    read(bufConn, 1)// ignore version
-
-    ulen := read(bufConn, 1)[0]
-    uname := read(bufConn, ulen)
-
-    plen := read(bufConn, 1)[0]
-    passwd := read(bufConn, plen)
-
-    token := fmt.Sprintf("%s:%s",uname,passwd)
-    success := users[token]
-    if success {
-        reply(bufConn, authSuccess)
-    } else {
-        reply(bufConn, authFailure)
+func Auth(conn io.ReadWriter) bool {
+    version := read(conn, 1)[0]
+    if version != authVersion {
+        log.Println("Unsupport auth version",version)
+        reply(conn, version, authFailure)
+        return false
     }
 
-    return success
+    ulen := read(conn, 1)[0]
+    uname := read(conn, ulen)
+
+    plen := read(conn, 1)[0]
+    passwd := read(conn, plen)
+
+    token := fmt.Sprintf("%s:%s",uname,passwd)
+    succ := users[token]
+    if succ {
+        reply(conn, version, authSuccess)
+    } else {
+        reply(conn, version, authFailure)
+    }
+    return succ
 }
 
 func proxy(dst io.Writer, src io.Reader, c chan int) {
@@ -146,19 +153,22 @@ func Serve(conn net.Conn) {
         authType = UserPassAuth
     }
     if bytes.IndexByte(methods, authType) == -1 {
-        reply(conn,noAcceptable)
+        reply(conn,socksVersion, noAcceptable)
         return
     }
 
-    reply(conn, authType)
+    reply(conn, socksVersion, authType)
 
     if authType == UserPassAuth {
-        Auth(conn)
+        succ := Auth(conn)
+        if !succ {
+            return
+        }
     }
 
     req := readRequest(conn)
     if req == nil {
-        reply(conn,addrTypeNotSupported)
+        reply(conn,socksVersion, addrTypeNotSupported)
         return
     }
 
@@ -166,12 +176,12 @@ func Serve(conn net.Conn) {
     case ConnectCommand:
         dst_conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", req.DSTAddr, req.DSTPort))
         if err != nil {
-            reply(conn, hostUnreachable)
+            reply(conn, socksVersion, hostUnreachable)
             log.Println("connect to dst failed: ", err)
             return
         }
         defer dst_conn.Close()
-        reply(conn, successReply,0, ipv4Address, 0,0,0,0, 0,0)
+        reply(conn, socksVersion, successReply,0, ipv4Address, 0,0,0,0, 0,0)
 
         c := make(chan int, 2)
         go proxy(dst_conn, conn, c)
@@ -181,7 +191,8 @@ func Serve(conn net.Conn) {
             <-c
         }
     default:
-        reply(conn,commandNotSupported)
+        log.Println("Unsupport command:", req.Cmd)
+        reply(conn,socksVersion, commandNotSupported)
     }
 
 }
